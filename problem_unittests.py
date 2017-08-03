@@ -1,199 +1,151 @@
-import os
-import numpy as np
+from copy import deepcopy
+from unittest import mock
 import tensorflow as tf
-import random
-from unittest.mock import MagicMock
 
 
-def _print_success_message():
-    print('Tests Passed')
+def test_safe(func):
+    """
+    Isolate tests
+    """
+    def func_wrapper(*args):
+        with tf.Graph().as_default():
+            result = func(*args)
+        print('Tests Passed')
+        return result
+
+    return func_wrapper
 
 
-def test_folder_path(cifar10_dataset_folder_path):
-    assert cifar10_dataset_folder_path is not None,\
-        'Cifar-10 data folder not set.'
-    assert cifar10_dataset_folder_path[-1] != '/',\
-        'The "/" shouldn\'t be added to the end of the path.'
-    assert os.path.exists(cifar10_dataset_folder_path),\
-        'Path not found.'
-    assert os.path.isdir(cifar10_dataset_folder_path),\
-        '{} is not a folder.'.format(os.path.basename(cifar10_dataset_folder_path))
+def _assert_tensor_shape(tensor, shape, display_name):
+    assert tf.assert_rank(tensor, len(shape), message='{} has wrong rank'.format(display_name))
+
+    tensor_shape = tensor.get_shape().as_list() if len(shape) else []
 
-    train_files = [cifar10_dataset_folder_path + '/data_batch_' + str(batch_id) for batch_id in range(1, 6)]
-    other_files = [cifar10_dataset_folder_path + '/batches.meta', cifar10_dataset_folder_path + '/test_batch']
-    missing_files = [path for path in train_files + other_files if not os.path.exists(path)]
+    wrong_dimension = [ten_dim for ten_dim, cor_dim in zip(tensor_shape, shape)
+                       if cor_dim is not None and ten_dim != cor_dim]
+    assert not wrong_dimension, \
+        '{} has wrong shape.  Found {}'.format(display_name, tensor_shape)
 
-    assert not missing_files,\
-        'Missing files in directory: {}'.format(missing_files)
 
-    print('All files found!')
+def _check_input(tensor, shape, display_name, tf_name=None):
+    assert tensor.op.type == 'Placeholder', \
+        '{} is not a Placeholder.'.format(display_name)
 
+    _assert_tensor_shape(tensor, shape, 'Real Input')
 
-def test_normalize(normalize):
-    test_shape = (np.random.choice(range(1000)), 32, 32, 3)
-    test_numbers = np.random.choice(range(256), test_shape)
-    normalize_out = normalize(test_numbers)
+    if tf_name:
+        assert tensor.name == tf_name, \
+            '{} has bad name.  Found name {}'.format(display_name, tensor.name)
 
-    assert type(normalize_out).__module__ == np.__name__,\
-        'Not Numpy Object'
 
-    assert normalize_out.shape == test_shape,\
-        'Incorrect Shape. {} shape found'.format(normalize_out.shape)
+class TmpMock():
+    """
+    Mock a attribute.  Restore attribute when exiting scope.
+    """
+    def __init__(self, module, attrib_name):
+        self.original_attrib = deepcopy(getattr(module, attrib_name))
+        setattr(module, attrib_name, mock.MagicMock())
+        self.module = module
+        self.attrib_name = attrib_name
+
+    def __enter__(self):
+        return getattr(self.module, self.attrib_name)
 
-    assert normalize_out.max() <= 1 and normalize_out.min() >= 0,\
-        'Incorect Range. {} to {} found'.format(normalize_out.min(), normalize_out.max())
+    def __exit__(self, type, value, traceback):
+        setattr(self.module, self.attrib_name, self.original_attrib)
 
-    _print_success_message()
 
+@test_safe
+def test_model_inputs(model_inputs):
+    image_width = 28
+    image_height = 28
+    image_channels = 3
+    z_dim = 100
+    input_real, input_z, learn_rate = model_inputs(image_width, image_height, image_channels, z_dim)
 
-def test_one_hot_encode(one_hot_encode):
-    test_shape = np.random.choice(range(1000))
-    test_numbers = np.random.choice(range(10), test_shape)
-    one_hot_out = one_hot_encode(test_numbers)
+    _check_input(input_real, [None, image_width, image_height, image_channels], 'Real Input')
+    _check_input(input_z, [None, z_dim], 'Z Input')
+    _check_input(learn_rate, [], 'Learning Rate')
 
-    assert type(one_hot_out).__module__ == np.__name__,\
-        'Not Numpy Object'
 
-    assert one_hot_out.shape == (test_shape, 10),\
-        'Incorrect Shape. {} shape found'.format(one_hot_out.shape)
+@test_safe
+def test_discriminator(discriminator, tf_module):
+    with TmpMock(tf_module, 'variable_scope') as mock_variable_scope:
+        image = tf.placeholder(tf.float32, [None, 28, 28, 3])
 
-    n_encode_tests = 5
-    test_pairs = list(zip(test_numbers, one_hot_out))
-    test_indices = np.random.choice(len(test_numbers), n_encode_tests)
-    labels = [test_pairs[test_i][0] for test_i in test_indices]
-    enc_labels = np.array([test_pairs[test_i][1] for test_i in test_indices])
-    new_enc_labels = one_hot_encode(labels)
+        output, logits = discriminator(image)
+        _assert_tensor_shape(output, [None, 1], 'Discriminator Training(reuse=false) output')
+        _assert_tensor_shape(logits, [None, 1], 'Discriminator Training(reuse=false) Logits')
+        assert mock_variable_scope.called,\
+            'tf.variable_scope not called in Discriminator Training(reuse=false)'
+        assert mock_variable_scope.call_args == mock.call('discriminator', reuse=False), \
+            'tf.variable_scope called with wrong arguments in Discriminator Training(reuse=false)'
 
-    assert np.array_equal(enc_labels, new_enc_labels),\
-        'Encodings returned different results for the same numbers.\n' \
-        'For the first call it returned:\n' \
-        '{}\n' \
-        'For the second call it returned\n' \
-        '{}\n' \
-        'Make sure you save the map of labels to encodings outside of the function.'.format(enc_labels, new_enc_labels)
+        mock_variable_scope.reset_mock()
 
-    _print_success_message()
+        output_reuse, logits_reuse = discriminator(image, True)
+        _assert_tensor_shape(output_reuse, [None, 1], 'Discriminator Inference(reuse=True) output')
+        _assert_tensor_shape(logits_reuse, [None, 1], 'Discriminator Inference(reuse=True) Logits')
+        assert mock_variable_scope.called, \
+            'tf.variable_scope not called in Discriminator Inference(reuse=True)'
+        assert mock_variable_scope.call_args == mock.call('discriminator', reuse=True), \
+            'tf.variable_scope called with wrong arguments in Discriminator Inference(reuse=True)'
 
 
-def test_nn_image_inputs(neural_net_image_input):
-    image_shape = (32, 32, 3)
-    nn_inputs_out_x = neural_net_image_input(image_shape)
+@test_safe
+def test_generator(generator, tf_module):
+    with TmpMock(tf_module, 'variable_scope') as mock_variable_scope:
+        z = tf.placeholder(tf.float32, [None, 100])
+        out_channel_dim = 5
 
-    assert nn_inputs_out_x.get_shape().as_list() == [None, image_shape[0], image_shape[1], image_shape[2]],\
-        'Incorrect Image Shape.  Found {} shape'.format(nn_inputs_out_x.get_shape().as_list())
+        output = generator(z, out_channel_dim)
+        _assert_tensor_shape(output, [None, 28, 28, out_channel_dim], 'Generator output (is_train=True)')
+        assert mock_variable_scope.called, \
+            'tf.variable_scope not called in Generator Training(reuse=false)'
+        assert mock_variable_scope.call_args == mock.call('generator', reuse=False), \
+            'tf.variable_scope called with wrong arguments in Generator Training(reuse=false)'
+
+        mock_variable_scope.reset_mock()
+        output = generator(z, out_channel_dim, False)
+        _assert_tensor_shape(output, [None, 28, 28, out_channel_dim], 'Generator output (is_train=False)')
+        assert mock_variable_scope.called, \
+            'tf.variable_scope not called in Generator Inference(reuse=True)'
+        assert mock_variable_scope.call_args == mock.call('generator', reuse=True), \
+            'tf.variable_scope called with wrong arguments in Generator Inference(reuse=True)'
+
+
+@test_safe
+def test_model_loss(model_loss):
+    out_channel_dim = 4
+    input_real = tf.placeholder(tf.float32, [None, 28, 28, out_channel_dim])
+    input_z = tf.placeholder(tf.float32, [None, 100])
+
+    d_loss, g_loss = model_loss(input_real, input_z, out_channel_dim)
+
+    _assert_tensor_shape(d_loss, [], 'Discriminator Loss')
+    _assert_tensor_shape(d_loss, [], 'Generator Loss')
+
+
+@test_safe
+def test_model_opt(model_opt, tf_module):
+    with TmpMock(tf_module, 'trainable_variables') as mock_trainable_variables:
+        with tf.variable_scope('discriminator'):
+            discriminator_logits = tf.Variable(tf.zeros([3, 3]))
+        with tf.variable_scope('generator'):
+            generator_logits = tf.Variable(tf.zeros([3, 3]))
+
+        mock_trainable_variables.return_value = [discriminator_logits, generator_logits]
+        d_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
+            logits=discriminator_logits,
+            labels=[[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]))
+        g_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(
+            logits=generator_logits,
+            labels=[[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]))
+        learning_rate = 0.001
+        beta1 = 0.9
+
+        d_train_opt, g_train_opt = model_opt(d_loss, g_loss, learning_rate, beta1)
+        assert mock_trainable_variables.called,\
+            'tf.mock_trainable_variables not called'
 
-    assert nn_inputs_out_x.op.type == 'Placeholder',\
-        'Incorrect Image Type.  Found {} type'.format(nn_inputs_out_x.op.type)
 
-    assert nn_inputs_out_x.name == 'x:0', \
-        'Incorrect Name.  Found {}'.format(nn_inputs_out_x.name)
-
-    print('Image Input Tests Passed.')
-
-
-def test_nn_label_inputs(neural_net_label_input):
-    n_classes = 10
-    nn_inputs_out_y = neural_net_label_input(n_classes)
-
-    assert nn_inputs_out_y.get_shape().as_list() == [None, n_classes],\
-        'Incorrect Label Shape.  Found {} shape'.format(nn_inputs_out_y.get_shape().as_list())
-
-    assert nn_inputs_out_y.op.type == 'Placeholder',\
-        'Incorrect Label Type.  Found {} type'.format(nn_inputs_out_y.op.type)
-
-    assert nn_inputs_out_y.name == 'y:0', \
-        'Incorrect Name.  Found {}'.format(nn_inputs_out_y.name)
-
-    print('Label Input Tests Passed.')
-
-
-def test_nn_keep_prob_inputs(neural_net_keep_prob_input):
-    nn_inputs_out_k = neural_net_keep_prob_input()
-
-    assert nn_inputs_out_k.get_shape().ndims is None,\
-        'Too many dimensions found for keep prob.  Found {} dimensions.  It should be a scalar (0-Dimension Tensor).'.format(nn_inputs_out_k.get_shape().ndims)
-
-    assert nn_inputs_out_k.op.type == 'Placeholder',\
-        'Incorrect keep prob Type.  Found {} type'.format(nn_inputs_out_k.op.type)
-
-    assert nn_inputs_out_k.name == 'keep_prob:0', \
-        'Incorrect Name.  Found {}'.format(nn_inputs_out_k.name)
-
-    print('Keep Prob Tests Passed.')
-
-
-def test_con_pool(conv2d_maxpool):
-    test_x = tf.placeholder(tf.float32, [None, 32, 32, 5])
-    test_num_outputs = 10
-    test_con_k = (2, 2)
-    test_con_s = (4, 4)
-    test_pool_k = (2, 2)
-    test_pool_s = (2, 2)
-
-    conv2d_maxpool_out = conv2d_maxpool(test_x, test_num_outputs, test_con_k, test_con_s, test_pool_k, test_pool_s)
-
-    assert conv2d_maxpool_out.get_shape().as_list() == [None, 4, 4, 10],\
-        'Incorrect Shape.  Found {} shape'.format(conv2d_maxpool_out.get_shape().as_list())
-
-    _print_success_message()
-
-
-def test_flatten(flatten):
-    test_x = tf.placeholder(tf.float32, [None, 10, 30, 6])
-    flat_out = flatten(test_x)
-
-    assert flat_out.get_shape().as_list() == [None, 10*30*6],\
-        'Incorrect Shape.  Found {} shape'.format(flat_out.get_shape().as_list())
-
-    _print_success_message()
-
-
-def test_fully_conn(fully_conn):
-    test_x = tf.placeholder(tf.float32, [None, 128])
-    test_num_outputs = 40
-
-    fc_out = fully_conn(test_x, test_num_outputs)
-
-    assert fc_out.get_shape().as_list() == [None, 40],\
-        'Incorrect Shape.  Found {} shape'.format(fc_out.get_shape().as_list())
-
-    _print_success_message()
-
-
-def test_output(output):
-    test_x = tf.placeholder(tf.float32, [None, 128])
-    test_num_outputs = 40
-
-    output_out = output(test_x, test_num_outputs)
-
-    assert output_out.get_shape().as_list() == [None, 40],\
-        'Incorrect Shape.  Found {} shape'.format(output_out.get_shape().as_list())
-
-    _print_success_message()
-
-
-def test_conv_net(conv_net):
-    test_x = tf.placeholder(tf.float32, [None, 32, 32, 3])
-    test_k = tf.placeholder(tf.float32)
-
-    logits_out = conv_net(test_x, test_k)
-
-    assert logits_out.get_shape().as_list() == [None, 10],\
-        'Incorrect Model Output.  Found {}'.format(logits_out.get_shape().as_list())
-
-    print('Neural Network Built!')
-
-
-def test_train_nn(train_neural_network):
-    mock_session = tf.Session()
-    test_x = np.random.rand(128, 32, 32, 3)
-    test_y = np.random.rand(128, 10)
-    test_k = np.random.rand(1)
-    test_optimizer = tf.train.AdamOptimizer()
-
-    mock_session.run = MagicMock()
-    train_neural_network(mock_session, test_optimizer, test_k, test_x, test_y)
-
-    assert mock_session.run.called, 'Session not used'
-
-    _print_success_message()
